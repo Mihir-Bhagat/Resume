@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A.T.D Asset Explorer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root{
+    --bg:#0b1120; --panel:#0f172a; --panel2:#131c31; --border:#1e293b; --border2:#243149;
+    --text:#e2e8f0; --muted:#8896ad; --muted2:#5b6b85;
+    --blue:#3b82f6; --blue-dim:#1d4ed8;
+    --green:#10b981; --amber:#f59e0b; --red:#ef4444; --purple:#a78bfa;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Arial,sans-serif;
+    min-height:100vh;
+  }
+  ::selection{background:rgba(59,130,246,.35);}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+
+  /* ---- Top bar ---- */
+  header{
+    position:sticky; top:0; z-index:30;
+    background:linear-gradient(180deg,#0d1526 0%,#0b1120 100%);
+    border-bottom:1px solid var(--border);
+  }
+  .header-inner{max-width:1400px;margin:0 auto;padding:14px 22px;display:flex;align-items:center;gap:18px;flex-wrap:wrap;}
+  .brand{display:flex;align-items:center;gap:10px;margin-right:auto;}
+  .brand-badge{
+    width:34px;height:34px;border-radius:9px;
+    background:linear-gradient(135deg,#3b82f6,#8b5cf6);
+    display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff;
+    flex-shrink:0;
+  }
+  .brand-text .t{font-size:14px;font-weight:600;color:#fff;line-height:1.2;}
+  .brand-text .s{font-size:11px;color:var(--muted2);letter-spacing:.04em;}
+
+  nav.tabs{display:flex;gap:4px;background:#0d1526;border:1px solid var(--border);padding:4px;border-radius:10px;}
+  nav.tabs button{
+    appearance:none;border:none;background:transparent;color:var(--muted);
+    font-size:12.5px;font-weight:600;padding:8px 14px;border-radius:7px;cursor:pointer;
+    display:flex;align-items:center;gap:6px;transition:.15s;
+  }
+  nav.tabs button:hover{color:var(--text);}
+  nav.tabs button.active{background:var(--blue);color:#fff;}
+
+  .file-controls{display:flex;align-items:center;gap:10px;}
+  .btn{
+    appearance:none;border:1px solid var(--border2);background:var(--panel2);color:var(--text);
+    font-size:12.5px;font-weight:600;padding:8px 14px;border-radius:8px;cursor:pointer;transition:.15s;
+    display:inline-flex;align-items:center;gap:6px;white-space:nowrap;
+  }
+  .btn:hover{border-color:var(--blue);color:#fff;}
+  .btn.primary{background:var(--blue);border-color:var(--blue);color:#fff;}
+  .btn.primary:hover{background:var(--blue-dim);}
+  #fileName{font-size:11.5px;color:var(--muted2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  input[type=file]{display:none;}
+
+  /* ---- Layout ---- */
+  main{max-width:1400px;margin:0 auto;padding:20px 22px 60px;}
+  .view{display:none;}
+  .view.active{display:block;}
+
+  .layout{display:grid;grid-template-columns:270px 1fr;gap:18px;align-items:start;}
+  @media (max-width:860px){.layout{grid-template-columns:1fr;}}
+
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;}
+  .sidebar{padding:16px;position:sticky;top:78px;}
+  .sidebar h2{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted2);margin:0 0 12px;font-weight:700;}
+  .sidebar h2 .count{color:var(--muted);font-weight:500;text-transform:none;letter-spacing:0;}
+
+  label.field{display:block;margin-bottom:12px;}
+  label.field span{display:block;font-size:11px;color:var(--muted2);margin-bottom:5px;font-weight:600;}
+  .search-wrap{position:relative;}
+  .search-wrap svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);opacity:.45;}
+  input[type=text], select{
+    width:100%;background:#0b1424;border:1px solid var(--border2);color:var(--text);
+    font-size:13px;padding:9px 10px;border-radius:8px;outline:none;transition:.15s;
+    font-family:inherit;
+  }
+  input[type=text]{padding-left:32px;}
+  input[type=text]:focus, select:focus{border-color:var(--blue);}
+  select{appearance:none;cursor:pointer;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'><path d='M1 3l4 4 4-4' stroke='%238896ad' stroke-width='1.4' fill='none'/></svg>");
+    background-repeat:no-repeat;background-position:right 10px center;padding-right:28px;
+  }
+  .clear-link{font-size:11.5px;color:var(--blue);cursor:pointer;background:none;border:none;padding:0;text-decoration:underline;}
+  .clear-link:hover{color:#93c5fd;}
+
+  /* Tree list (sheet 2 & 3 sidebars) */
+  .tree{max-height:calc(100vh - 220px);overflow-y:auto;margin:0;padding:0;list-style:none;}
+  .tree li{margin-bottom:2px;}
+  .tree button{
+    width:100%;text-align:left;background:transparent;border:none;color:var(--text);
+    padding:9px 10px;border-radius:8px;cursor:pointer;font-size:13px;
+    display:flex;align-items:center;justify-content:space-between;gap:8px;transition:.12s;
+    border-left:2px solid transparent;
+  }
+  .tree button:hover{background:var(--panel2);}
+  .tree button.active{background:rgba(59,130,246,.14);border-left:2px solid var(--blue);color:#fff;}
+  .tree button .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .tree button .badge-count{
+    flex-shrink:0;font-size:10.5px;color:var(--muted2);background:#0b1424;border:1px solid var(--border2);
+    padding:1px 7px;border-radius:99px;font-family:ui-monospace,monospace;
+  }
+  .tree button.active .badge-count{color:#93c5fd;border-color:#2f4670;}
+
+  /* ---- Stat cards (repository) ---- */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px;}
+  .stat-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:13px 14px;}
+  .stat-card .lbl{font-size:11px;color:var(--muted);font-weight:600;margin-bottom:6px;}
+  .stat-card .val{font-size:22px;font-weight:700;color:#fff;font-family:ui-monospace,monospace;}
+  .dot{width:7px;height:7px;border-radius:99px;display:inline-block;margin-right:6px;}
+
+  /* ---- Cards grid (repository) ---- */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:13px;padding:15px;transition:.15s;}
+  .card:hover{border-color:var(--border2);transform:translateY(-1px);}
+  .card .top-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:9px;}
+  .tag{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:3px 8px;border-radius:99px;}
+  .tag.practice{background:rgba(139,92,246,.15);color:#c4b5fd;}
+  .status-pill{display:inline-flex;align-items:center;font-size:10.5px;font-weight:600;padding:3px 9px;border-radius:99px;white-space:nowrap;}
+  .card h3{font-size:14.5px;font-weight:600;color:#fff;margin:0 0 6px;}
+  .card .category{font-size:11px;color:var(--muted2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;}
+  .card p{font-size:12.5px;color:var(--muted);line-height:1.5;margin:0 0 8px;}
+  .card p b{color:#b6c2d9;font-weight:600;}
+  .card .meta-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);}
+  .chip{font-size:10.5px;color:var(--muted);background:#0b1424;border:1px solid var(--border2);padding:3px 8px;border-radius:7px;}
+  .card a.link-out{font-size:11.5px;color:var(--blue);text-decoration:none;display:inline-flex;align-items:center;gap:4px;margin-top:10px;}
+  .card a.link-out:hover{text-decoration:underline;}
+
+  /* ---- Detail lists (sheet 2/3 right panel) ---- */
+  .detail-header{margin-bottom:16px;}
+  .detail-header h2{font-size:19px;font-weight:700;color:#fff;margin:0 0 4px;}
+  .detail-header p{font-size:12.5px;color:var(--muted2);margin:0;}
+  .detail-list{display:flex;flex-direction:column;gap:10px;}
+  .detail-item{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;}
+  .detail-item .asset-name{font-size:14px;font-weight:600;color:#fff;margin-bottom:10px;display:flex;align-items:center;gap:8px;}
+  .detail-item .asset-name .idx{
+    width:20px;height:20px;border-radius:6px;background:rgba(59,130,246,.15);color:#93c5fd;
+    font-size:10.5px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  }
+  .kv{display:grid;grid-template-columns:90px 1fr;gap:4px 10px;font-size:12.5px;margin-bottom:6px;}
+  .kv .k{color:var(--muted2);font-weight:600;}
+  .kv .v{color:var(--muted);line-height:1.5;}
+  .kv .v.value-tag{display:inline-block;color:#a7f3d0;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);padding:2px 8px;border-radius:6px;font-weight:600;width:fit-content;}
+
+  .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:70px 20px;text-align:center;color:var(--muted2);}
+  .empty svg{opacity:.35;margin-bottom:14px;}
+  .empty .h{color:var(--muted);font-size:14px;font-weight:600;margin-bottom:4px;}
+  .empty .s{font-size:12.5px;max-width:320px;}
+
+  /* ---- Upload gate ---- */
+  #uploadGate{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:110px 20px;text-align:center;}
+  #uploadGate .icon{width:64px;height:64px;border-radius:16px;background:var(--panel2);border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;margin-bottom:20px;}
+  #uploadGate h1{font-size:20px;color:#fff;margin:0 0 8px;}
+  #uploadGate p{font-size:13px;color:var(--muted2);max-width:420px;margin:0 0 24px;line-height:1.6;}
+  #dropZone{
+    border:1.5px dashed var(--border2);border-radius:14px;padding:34px 50px;cursor:pointer;transition:.15s;background:var(--panel);
+  }
+  #dropZone:hover, #dropZone.dragover{border-color:var(--blue);background:rgba(59,130,246,.06);}
+  #dropZone .dz-text{font-size:13px;color:var(--muted);margin-top:10px;}
+  #dropZone .dz-text b{color:#93c5fd;}
+  .sheet-req{margin-top:22px;font-size:11.5px;color:var(--muted2);display:flex;gap:18px;flex-wrap:wrap;justify-content:center;}
+  .sheet-req span b{color:var(--muted);}
+
+  #app{display:none;}
+  ::-webkit-scrollbar{width:8px;height:8px;}
+  ::-webkit-scrollbar-thumb{background:#243149;border-radius:99px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <div class="brand-badge">AT</div>
+      <div class="brand-text">
+        <div class="t">A.T.D Asset Explorer</div>
+        <div class="s">REPOSITORY · CATEGORY MAP · ACCOUNT SUMMARY</div>
+      </div>
+    </div>
+
+    <nav class="tabs" id="tabs" style="display:none;">
+      <button data-view="repo" class="active">Repository</button>
+      <button data-view="catmap">Category Map</button>
+      <button data-view="account">Account Summary</button>
+    </nav>
+
+    <div class="file-controls">
+      <span id="fileName"></span>
+      <button class="btn" id="reloadBtn" style="display:none;">Load different file</button>
+      <button class="btn primary" id="uploadBtnHeader" style="display:none;">Upload workbook</button>
+    </div>
+    <input type="file" id="fileInput" accept=".xlsx,.xls">
+  </div>
+</header>
+
+<main>
+
+  <!-- Upload gate -->
+  <div id="uploadGate">
+    <div class="icon">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#8896ad" stroke-width="1.6"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+    </div>
+    <h1>Load your tracker workbook</h1>
+    <p>Upload the .xlsx export containing your three sheets — the app reads them entirely in your browser. Nothing is uploaded anywhere.</p>
+    <div id="dropZone">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#8896ad" stroke-width="1.6" style="display:block;margin:0 auto;"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>
+      <div class="dz-text">Drag & drop your .xlsx here, or <b>click to browse</b></div>
+    </div>
+    <div class="sheet-req">
+      <span><b>Sheet 1</b> — Repository (Practice, Category, Assets, Purpose, Benefit, Link, Type, Status...)</span>
+      <span><b>Sheet 2</b> — Category Map (Mapped Category, Assets Deployed, Problem)</span>
+      <span><b>Sheet 3</b> — Account Summary (Account, Assets Deployed, Solution, Value)</span>
+    </div>
+  </div>
+
+  <div id="app">
+
+    <!-- ============ VIEW 1: REPOSITORY ============ -->
+    <section class="view active" id="view-repo">
+      <div class="stats" id="repoStats"></div>
+      <div class="layout">
+        <aside class="panel sidebar">
+          <h2>Repository</h2>
+          <label class="field">
+            <span>Search</span>
+            <div class="search-wrap">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8896ad" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+              <input type="text" id="repoSearch" placeholder="Asset, purpose, benefit...">
+            </div>
+          </label>
+          <label class="field">
+            <span>Practice</span>
+            <select id="repoPractice"><option value="">All Practices</option></select>
+          </label>
+          <label class="field">
+            <span>Category</span>
+            <select id="repoCategory"><option value="">All Categories</option></select>
+          </label>
+          <label class="field">
+            <span>Status</span>
+            <select id="repoStatus"><option value="">All Statuses</option></select>
+          </label>
+          <button class="clear-link" id="repoClear">Clear all filters</button>
+        </aside>
+        <div>
+          <p style="font-size:11.5px;color:var(--muted2);margin:0 0 12px;" id="repoCount"></p>
+          <div class="grid" id="repoGrid"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ VIEW 2: CATEGORY MAP ============ -->
+    <section class="view" id="view-catmap">
+      <div class="layout">
+        <aside class="panel sidebar">
+          <h2>Category Map <span class="count" id="catmapTotal"></span></h2>
+          <label class="field">
+            <span>Filter categories</span>
+            <div class="search-wrap">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8896ad" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+              <input type="text" id="catmapSearch" placeholder="Find a category...">
+            </div>
+          </label>
+          <ul class="tree" id="catmapTree"></ul>
+        </aside>
+        <div class="panel" style="padding:22px;" id="catmapDetail"></div>
+      </div>
+    </section>
+
+    <!-- ============ VIEW 3: ACCOUNT SUMMARY ============ -->
+    <section class="view" id="view-account">
+      <div class="layout">
+        <aside class="panel sidebar">
+          <h2>Asset Category Summary <span class="count" id="accountTotal"></span></h2>
+          <label class="field">
+            <span>Filter accounts</span>
+            <div class="search-wrap">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8896ad" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+              <input type="text" id="accountSearch" placeholder="Find an account...">
+            </div>
+          </label>
+          <ul class="tree" id="accountTree"></ul>
+        </aside>
+        <div class="panel" style="padding:22px;" id="accountDetail"></div>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<script>
+/* ============================================================
+   DATA MODEL & HEADER NORMALIZATION
+   ============================================================ */
+const STATUS_STYLE = {
+  'deployed':      {bg:'rgba(16,185,129,.15)', text:'#6ee7b7', dot:'#10b981'},
+  'poc on-going':  {bg:'rgba(59,130,246,.15)',  text:'#93c5fd', dot:'#3b82f6'},
+  'poc ongoing':   {bg:'rgba(59,130,246,.15)',  text:'#93c5fd', dot:'#3b82f6'},
+  'assess/prepare':{bg:'rgba(245,158,11,.15)',  text:'#fcd34d', dot:'#f59e0b'},
+  'rejected':      {bg:'rgba(239,68,68,.15)',   text:'#fca5a5', dot:'#ef4444'},
+};
+function statusStyle(s){
+  return STATUS_STYLE[(s||'').toString().trim().toLowerCase()] || {bg:'rgba(148,163,184,.15)', text:'#cbd5e1', dot:'#94a3b8'};
+}
+
+function norm(h){ return (h||'').toString().trim().toLowerCase().replace(/[^a-z0-9]/g,''); }
+
+// alias -> list of normalized header keys that could map to it
+function buildRowMapper(aliasMap){
+  return function(rawRow){
+    const normalizedKeys = {};
+    Object.keys(rawRow).forEach(k => { normalizedKeys[norm(k)] = rawRow[k]; });
+    const out = {};
+    Object.keys(aliasMap).forEach(field => {
+      const candidates = aliasMap[field];
+      for(const c of candidates){
+        if(normalizedKeys[c] !== undefined && normalizedKeys[c] !== ''){
+          out[field] = normalizedKeys[c];
+          return;
+        }
+      }
+      out[field] = normalizedKeys[candidates[0]] ?? '';
+    });
+    return out;
+  };
+}
+
+const mapAsset = buildRowMapper({
+  practice:  ['practice'],
+  category:  ['category'],
+  asset:     ['assets','assetname','asset'],
+  purpose:   ['purpose'],
+  benefit:   ['benefit'],
+  link:      ['link','links','url'],
+  type:      ['typeofasset','type'],
+  status:    ['status'],
+  clients:   ['clientsimplemented','clients'],
+  comments:  ['comments','comment'],
+  spoc:      ['spoc'],
+});
+
+const mapMapping = buildRowMapper({
+  mappedCategory: ['mappedcategory'],
+  category:       ['category'],
+  practice:       ['practice'],
+  assetsDeployed: ['assetsdeployed'],
+  problem:        ['problem'],
+});
+
+const mapAccount = buildRowMapper({
+  account:        ['account'],
+  category:       ['category','assetcategory'],
+  assetsDeployed: ['assetsdeployed'],
+  solution:       ['solution'],
+  value:          ['value','valuegenerated'],
+});
+
+let DATA = { assets: [], mappings: [], accounts: [] };
+let filters = { search:'', practice:'', category:'', status:'' };
+let selectedCategory = null;
+let selectedAccount = null;
+
+/* ============================================================
+   FILE LOADING
+   ============================================================ */
+function findSheet(wb, nameGuesses, index){
+  for(const n of wb.SheetNames){
+    if(nameGuesses.includes(norm(n))) return wb.Sheets[n];
+  }
+  const name = wb.SheetNames[index];
+  return name ? wb.Sheets[name] : null;
+}
+
+function handleWorkbook(wb, filename){
+  const s1 = findSheet(wb, ['sheet1','repository'], 0);
+  const s2 = findSheet(wb, ['sheet2','categorymap','mappedcategory'], 1);
+  const s3 = findSheet(wb, ['sheet3','accountsummary','assetcategorysummary'], 2);
+
+  DATA.assets   = s1 ? XLSX.utils.sheet_to_json(s1, {defval:''}).map(mapAsset).filter(r => r.asset || r.practice) : [];
+  DATA.mappings = s2 ? XLSX.utils.sheet_to_json(s2, {defval:''}).map(mapMapping).filter(r => r.mappedCategory || r.assetsDeployed) : [];
+  DATA.accounts = s3 ? XLSX.utils.sheet_to_json(s3, {defval:''}).map(mapAccount).filter(r => r.account) : [];
+
+  document.getElementById('uploadGate').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('tabs').style.display = 'flex';
+  document.getElementById('uploadBtnHeader').style.display = 'inline-flex';
+  document.getElementById('reloadBtn').style.display = 'inline-flex';
+  document.getElementById('fileName').textContent = filename;
+
+  initRepositoryFilters();
+  renderRepository();
+  renderCategoryTree();
+  renderAccountTree();
+  renderCatmapDetail();
+  renderAccountDetail();
+}
+
+function loadFile(file){
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    const data = new Uint8Array(e.target.result);
+    const wb = XLSX.read(data, {type:'array'});
+    handleWorkbook(wb, file.name);
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+document.getElementById('fileInput').addEventListener('change', e => loadFile(e.target.files[0]));
+document.getElementById('dropZone').addEventListener('click', () => document.getElementById('fileInput').click());
+document.getElementById('uploadBtnHeader').addEventListener('click', () => document.getElementById('fileInput').click());
+document.getElementById('reloadBtn').addEventListener('click', () => document.getElementById('fileInput').click());
+
+const dz = document.getElementById('dropZone');
+['dragover','dragenter'].forEach(evt => dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.add('dragover'); }));
+['dragleave','drop'].forEach(evt => dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.remove('dragover'); }));
+dz.addEventListener('drop', e => { if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+/* ============================================================
+   TABS
+   ============================================================ */
+document.getElementById('tabs').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-view]');
+  if(!btn) return;
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + btn.dataset.view).classList.add('active');
+});
+
+/* ============================================================
+   VIEW 1 — REPOSITORY
+   ============================================================ */
+function initRepositoryFilters(){
+  const practices = [...new Set(DATA.assets.map(a => a.practice).filter(Boolean))].sort();
+  const categories = [...new Set(DATA.assets.map(a => a.category).filter(Boolean))].sort();
+  const statuses = [...new Set(DATA.assets.map(a => a.status).filter(Boolean))].sort();
+
+  fillSelect('repoPractice', practices, 'All Practices');
+  fillSelect('repoCategory', categories, 'All Categories');
+  fillSelect('repoStatus', statuses, 'All Statuses');
+
+  document.getElementById('repoSearch').oninput = e => { filters.search = e.target.value; renderRepository(); };
+  document.getElementById('repoPractice').onchange = e => { filters.practice = e.target.value; renderRepository(); };
+  document.getElementById('repoCategory').onchange = e => { filters.category = e.target.value; renderRepository(); };
+  document.getElementById('repoStatus').onchange = e => { filters.status = e.target.value; renderRepository(); };
+  document.getElementById('repoClear').onclick = () => {
+    filters = {search:'', practice:'', category:'', status:''};
+    document.getElementById('repoSearch').value = '';
+    document.getElementById('repoPractice').value = '';
+    document.getElementById('repoCategory').value = '';
+    document.getElementById('repoStatus').value = '';
+    renderRepository();
+  };
+}
+function fillSelect(id, options, allLabel){
+  const sel = document.getElementById(id);
+  sel.innerHTML = `<option value="">${allLabel}</option>` + options.map(o => `<option value="${escapeAttr(o)}">${escapeHtml(o)}</option>`).join('');
+}
+
+function renderRepository(){
+  const q = filters.search.toLowerCase();
+  const filtered = DATA.assets.filter(a => {
+    if(filters.practice && a.practice !== filters.practice) return false;
+    if(filters.category && a.category !== filters.category) return false;
+    if(filters.status && a.status !== filters.status) return false;
+    if(q){
+      const hay = [a.asset,a.purpose,a.benefit,a.category,a.practice].join(' ').toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  document.getElementById('repoCount').textContent =
+    `Showing ${filtered.length} of ${DATA.assets.length} assets`;
+
+  // stats
+  const statusCounts = {};
+  DATA.assets.forEach(a => { const s = a.status || 'Unspecified'; statusCounts[s] = (statusCounts[s]||0)+1; });
+  const statCards = [
+    {label:'Total Assets', value: DATA.assets.length, color:'#93c5fd'},
+    ...Object.keys(statusCounts).sort().map(s => ({label:s, value: statusCounts[s], color: statusStyle(s).text}))
+  ];
+  document.getElementById('repoStats').innerHTML = statCards.map(c => `
+    <div class="stat-card">
+      <div class="lbl" style="color:${c.color}">${escapeHtml(c.label)}</div>
+      <div class="val">${c.value}</div>
+    </div>`).join('');
+
+  const grid = document.getElementById('repoGrid');
+  if(filtered.length === 0){
+    grid.innerHTML = '';
+    grid.parentElement.querySelector('#repoEmpty')?.remove();
+    grid.insertAdjacentHTML('afterend', `<div class="empty" id="repoEmpty">
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#5b6b85" stroke-width="1.6"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <div class="h">No assets found</div>
+      <div class="s">Try adjusting your search or filters.</div>
+    </div>`);
+    return;
+  }
+  document.getElementById('repoEmpty')?.remove();
+
+  grid.innerHTML = filtered.map(a => {
+    const st = statusStyle(a.status);
+    return `
+    <div class="card">
+      <div class="top-row">
+        ${a.practice ? `<span class="tag practice">${escapeHtml(a.practice)}</span>` : '<span></span>'}
+        ${a.status ? `<span class="status-pill" style="background:${st.bg};color:${st.text}"><span class="dot" style="background:${st.dot}"></span>${escapeHtml(a.status)}</span>` : ''}
+      </div>
+      <h3>${escapeHtml(a.asset || 'Untitled Asset')}</h3>
+      ${a.category ? `<div class="category">${escapeHtml(a.category)}</div>` : ''}
+      ${a.purpose ? `<p><b>Purpose:</b> ${escapeHtml(a.purpose)}</p>` : ''}
+      ${a.benefit ? `<p><b>Benefit:</b> ${escapeHtml(a.benefit)}</p>` : ''}
+      <div class="meta-row">
+        ${a.type ? `<span class="chip">${escapeHtml(a.type)}</span>` : ''}
+        ${a.clients ? `<span class="chip">Clients: ${escapeHtml(a.clients)}</span>` : ''}
+        ${a.spoc ? `<span class="chip">SPOC: ${escapeHtml(a.spoc)}</span>` : ''}
+      </div>
+      ${a.comments ? `<p style="margin-top:8px;"><b>Comments:</b> ${escapeHtml(a.comments)}</p>` : ''}
+      ${a.link ? `<a class="link-out" href="${escapeAttr(a.link)}" target="_blank" rel="noopener">Open link →</a>` : ''}
+    </div>`;
+  }).join('');
+}
+
+/* ============================================================
+   VIEW 2 — CATEGORY MAP (tree)
+   ============================================================ */
+function groupBy(arr, key){
+  const map = new Map();
+  arr.forEach(item => {
+    const k = item[key] || 'Unspecified';
+    if(!map.has(k)) map.set(k, []);
+    map.get(k).push(item);
+  });
+  return map;
+}
+
+function renderCategoryTree(){
+  const grouped = groupBy(DATA.mappings, 'mappedCategory');
+  const entries = [...grouped.entries()].sort((a,b) => a[0].localeCompare(b[0]));
+  document.getElementById('catmapTotal').textContent = `(${entries.length})`;
+
+  if(!selectedCategory && entries.length) selectedCategory = entries[0][0];
+
+  const filterVal = (document.getElementById('catmapSearch').value || '').toLowerCase();
+  const tree = document.getElementById('catmapTree');
+  const visible = entries.filter(([name]) => name.toLowerCase().includes(filterVal));
+
+  tree.innerHTML = visible.map(([name, items]) => `
+    <li>
+      <button class="${name === selectedCategory ? 'active':''}" data-cat="${escapeAttr(name)}">
+        <span class="name">${escapeHtml(name)}</span>
+        <span class="badge-count">${items.length}</span>
+      </button>
+    </li>`).join('') || `<li style="padding:10px;color:var(--muted2);font-size:12.5px;">No matches</li>`;
+
+  tree.querySelectorAll('button[data-cat]').forEach(btn => {
+    btn.onclick = () => { selectedCategory = btn.dataset.cat; renderCategoryTree(); renderCatmapDetail(); };
+  });
+}
+document.getElementById('catmapSearch').oninput = renderCategoryTree;
+
+function renderCatmapDetail(){
+  const box = document.getElementById('catmapDetail');
+  if(!DATA.mappings.length){
+    box.innerHTML = emptyState('No category mapping data', 'Load a workbook with a populated Sheet 2.');
+    return;
+  }
+  const grouped = groupBy(DATA.mappings, 'mappedCategory');
+  const items = grouped.get(selectedCategory) || [];
+  box.innerHTML = `
+    <div class="detail-header">
+      <h2>${escapeHtml(selectedCategory || '—')}</h2>
+      <p>${items.length} asset${items.length===1?'':'s'} deployed under this mapped category</p>
+    </div>
+    <div class="detail-list">
+      ${items.map((it,i) => `
+        <div class="detail-item">
+          <div class="asset-name"><span class="idx">${i+1}</span>${escapeHtml(it.assetsDeployed || 'Unnamed asset')}</div>
+          ${it.practice ? `<div class="kv"><div class="k">Practice</div><div class="v">${escapeHtml(it.practice)}</div></div>` : ''}
+          ${it.category ? `<div class="kv"><div class="k">Category</div><div class="v">${escapeHtml(it.category)}</div></div>` : ''}
+          ${it.problem ? `<div class="kv"><div class="k">Problem solved</div><div class="v">${escapeHtml(it.problem)}</div></div>` : ''}
+        </div>`).join('') || emptyState('No items in this category','')}
+    </div>`;
+}
+
+/* ============================================================
+   VIEW 3 — ACCOUNT SUMMARY (tree)
+   ============================================================ */
+function renderAccountTree(){
+  const grouped = groupBy(DATA.accounts, 'account');
+  const entries = [...grouped.entries()].sort((a,b) => a[0].localeCompare(b[0]));
+  document.getElementById('accountTotal').textContent = `(${entries.length})`;
+
+  if(!selectedAccount && entries.length) selectedAccount = entries[0][0];
+
+  const filterVal = (document.getElementById('accountSearch').value || '').toLowerCase();
+  const tree = document.getElementById('accountTree');
+  const visible = entries.filter(([name]) => name.toLowerCase().includes(filterVal));
+
+  tree.innerHTML = visible.map(([name, items]) => `
+    <li>
+      <button class="${name === selectedAccount ? 'active':''}" data-acc="${escapeAttr(name)}">
+        <span class="name">${escapeHtml(name)}</span>
+        <span class="badge-count">${items.length}</span>
+      </button>
+    </li>`).join('') || `<li style="padding:10px;color:var(--muted2);font-size:12.5px;">No matches</li>`;
+
+  tree.querySelectorAll('button[data-acc]').forEach(btn => {
+    btn.onclick = () => { selectedAccount = btn.dataset.acc; renderAccountTree(); renderAccountDetail(); };
+  });
+}
+document.getElementById('accountSearch').oninput = renderAccountTree;
+
+function renderAccountDetail(){
+  const box = document.getElementById('accountDetail');
+  if(!DATA.accounts.length){
+    box.innerHTML = emptyState('No account summary data', 'Load a workbook with a populated Sheet 3.');
+    return;
+  }
+  const grouped = groupBy(DATA.accounts, 'account');
+  const items = grouped.get(selectedAccount) || [];
+  box.innerHTML = `
+    <div class="detail-header">
+      <h2>${escapeHtml(selectedAccount || '—')}</h2>
+      <p>${items.length} asset${items.length===1?'':'s'} deployed at this account</p>
+    </div>
+    <div class="detail-list">
+      ${items.map((it,i) => `
+        <div class="detail-item">
+          <div class="asset-name"><span class="idx">${i+1}</span>${escapeHtml(it.assetsDeployed || 'Unnamed asset')}</div>
+          ${it.category ? `<div class="kv"><div class="k">Category</div><div class="v">${escapeHtml(it.category)}</div></div>` : ''}
+          ${it.solution ? `<div class="kv"><div class="k">Solution</div><div class="v">${escapeHtml(it.solution)}</div></div>` : ''}
+          ${it.value ? `<div class="kv"><div class="k">Value</div><div class="v value-tag">${escapeHtml(it.value)}</div></div>` : ''}
+        </div>`).join('') || emptyState('No items for this account','')}
+    </div>`;
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+function emptyState(h, s){
+  return `<div class="empty">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#5b6b85" stroke-width="1.6"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+    <div class="h">${escapeHtml(h)}</div><div class="s">${escapeHtml(s)}</div>
+  </div>`;
+}
+function escapeHtml(str){
+  return (str===undefined||str===null?'':str.toString()).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+function escapeAttr(str){ return escapeHtml(str); }
+</script>
+</body>
+</html>
