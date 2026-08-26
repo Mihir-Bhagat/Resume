@@ -1,942 +1,767 @@
+Complete Detailed Prompt — SAP BW Monitoring Tracker GUI Changes
+Modify the existing SAP BW Monitoring Tracker automation script GUI to implement the following changes. This specification covers all field changes, new fields, renames, validations, visual indicators, button behaviors, section merges, dropdown logic, and reporting changes. Manager's requirements take priority in all cases. Additional items from the transcript discussion are included where they add value without conflicting with the manager's direction.
 
-"""
-Full Automation Script v12
-==========================
-
-CHANGES FROM v11:
-
-  1. REMOVED tabs: "Unique" and "DistinctUnique" — no longer generated.
-
-  2. ALL pivot tables (WTBP, VolumeAnalysis, MonthlyVolume) now:
-       • Source directly from "Original with Dups" (raw, no deduplication step)
-       • Values = DISTINCT COUNT of the Number column
-         (i.e. how many unique Number values appear in each cell's group/week/month)
-
-  3. Charts are built from the same distinct-count pivot tables.
-
-  4. Traffic-light colouring (avg-based ±20%) still applies to all value cells.
-
-  5. Closure tabs unchanged — still filter by Assignment Group, dedup on Task Number,
-     and summarise by Assigned To × Month.
-
-  6. MANAGED_TABS updated — Unique and DistinctUnique removed.
-
-KEY BEHAVIOUR:
-  For every pivot cell the script computes:
-    len( unique Number values in that Priority/Group × Week/Month slice )
-  This is equivalent to Excel's COUNTDISTINCT / DISTINCTCOUNT.
-"""
-
-import sys, os, datetime, warnings, traceback, io, tempfile
-
-import pandas as pd
-import openpyxl
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.chart import BarChart, LineChart, Reference
-import openpyxl.chart.label
-
-warnings.filterwarnings("ignore")
-
-MASTER_DATA_PATH = r""
-RAW_DATA_PATH = r""
-
-PRIORITY_ORDER = ["1 - Critical", "2 - High", "3 - Moderate", "4 - Low", "5 - Planning"]
-PRIORITY_LABELS = {
-    "1 - Critical": "1 Critical",
-    "2 - High": "2 High",
-    "3 - Moderate": "3 Moderate",
-    "4 - Low": "4 Low",
-    "5 - Planning": "5 Planning",
-}
-
-DARK_BLUE = "1E3A5F"
-MID_BLUE = "2E86AB"
-WHITE = "FFFFFF"
-ALT_PAT = PatternFill("solid", fgColor="EEF2FA")
-HEADER_FILL = PatternFill("solid", fgColor=DARK_BLUE)
-TOTAL_FILL = PatternFill("solid", fgColor=MID_BLUE)
-
-# Traffic-light fills (avg-based)
-RED_FILL = PatternFill("solid", fgColor="FF4C4C")
-AMBER_FILL = PatternFill("solid", fgColor="FFB347")
-GREEN_FILL = PatternFill("solid", fgColor="70C95E")
-
-# ── Closure group config ──────────────────────────────────────────────────────
-CLOSURE_GROUPS = [
-    ("FTS-GT-L3-Datalake", "ClosureGCP", "ClosureGCP_Table"),
-    ("FTS-GT-L3-Looker", "ClosureLooker", "ClosureLooker_Table"),
-    ("FTS-GT-L3-SAP BI", "ClosureBW", "ClosureBW_Table"),
-]
-
-# Unique & DistinctUnique removed
-MANAGED_TABS = [
-    "Original with Dups",
-    "WTBP",
-    "VolumeAnalysis",
-    "MonthlyVolume",
-    "Charts",
-    "ClosureGCP",
-    "ClosureLooker",
-    "ClosureBW",
-    "ClosureGCP_Table",
-    "ClosureLooker_Table",
-    "ClosureBW_Table",
-]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def fmt_week(d):
-    if d is None: return ""
-    if isinstance(d, datetime.date):
-        return d.strftime("%d-%b").lstrip("0")
-    return str(d)
-
-def fmt_month(d):
-    if d is None: return ""
-    if isinstance(d, datetime.date):
-        return d.strftime("%b-%Y")
-    return str(d)
-
-def _side(): return Side(style="thin", color="BFBFBF")
-def _border(): s = _side(); return Border(left=s, right=s, top=s, bottom=s)
-
-def _cell(ws, r, c, v, bold=False, fc="000000", fill=None,
-          align="center", wrap=False, sz=10):
-    cell = ws.cell(row=r, column=c, value=v)
-    cell.font = Font(name="Arial", size=sz, bold=bold, color=fc)
-    cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
-    cell.border = _border()
-    if fill: cell.fill = fill
-    return cell
-
-def hcell(ws, r, c, v, fill=None):
-    return _cell(ws, r, c, v, bold=True, fc=WHITE,
-                 fill=fill or HEADER_FILL, align="center", wrap=True)
-
-def dcell(ws, r, c, v, fill=None, align="center"):
-    return _cell(ws, r, c, v, fill=fill, align=align)
-
-def autofit(ws, mn=8, mx=40):
-    for col in ws.columns:
-        ltr = get_column_letter(col[0].column)
-        w = max((len(str(c.value)) for c in col if c.value), default=0)
-        ws.column_dimensions[ltr].width = min(max(w + 3, mn), mx)
-
-def find_col(df, names):
-    lower = {c.lower().strip(): c for c in df.columns}
-    for n in names:
-        if n.lower() in lower: return lower[n.lower()]
-    return None
-
-def _read_upload(uploader):
-    val = uploader.value
-    if not val: return None, None
-    if isinstance(val, dict):
-        name = list(val.keys())[0]
-        content = bytes(val[name]["content"])
-    else:
-        name = val[0]["name"]
-        content = bytes(val[0]["content"])
-    return name, content
-
-
-# ── Week & month detection ────────────────────────────────────────────────────
-
-def get_weeks_and_months_from_bytes(content: bytes):
-    df = pd.read_excel(io.BytesIO(content), sheet_name=0)
-    sc = find_col(df, ["start", "start date", "start_date", "created"])
-    if sc is None:
-        return [], [], df
-    df[sc] = pd.to_datetime(df[sc], errors="coerce")
-    valid = df[sc].dropna()
-    weeks = sorted(valid.apply(
-        lambda d: (d - pd.Timedelta(days=d.weekday())).date()
-    ).unique())
-    months = sorted(valid.apply(
-        lambda d: d.date().replace(day=1)
-    ).unique())
-    return weeks, months, df
-
-
-# ── Traffic-light helpers ─────────────────────────────────────────────────────
-
-def _traffic_fill_avg(val, avg, tolerance=0.20):
-    if avg == 0:
-        return RED_FILL if val == 0 else GREEN_FILL
-    lo = avg * (1 - tolerance)
-    hi = avg * (1 + tolerance)
-    if val > hi: return GREEN_FILL
-    elif val >= lo: return AMBER_FILL
-    else: return RED_FILL
-
-def _tl_dcell(ws, r, c, val, avg):
-    fill = _traffic_fill_avg(val, avg)
-    cell = ws.cell(row=r, column=c, value=val)
-    cell.font = Font(name="Arial", size=10, color="000000")
-    cell.alignment = Alignment(horizontal="center", vertical="center")
-    cell.border = _border()
-    cell.fill = fill
-    return cell
-
-
-# ── Distinct-count pivot builder ──────────────────────────────────────────────
-
-def _distinct_count_pivot(df, index_col, col_col, number_col):
-    """
-    Returns a DataFrame where each cell = number of DISTINCT values in
-    `number_col` for that (index_col, col_col) combination.
-    Equivalent to COUNTDISTINCT / DISTINCTCOUNT in Excel / DAX.
-    """
-    if df.empty or number_col is None:
-        return pd.DataFrame()
-    return (
-        df.groupby([index_col, col_col])[number_col]
-        .nunique()
-        .unstack(fill_value=0)
-    )
-
-
-# ── Combo chart builder ───────────────────────────────────────────────────────
-
-def _combo(ws_d, d_start, d_end, cat_c, v_start, v_end, tot_c,
-           title, w=24, h=14):
-    bar = BarChart(); bar.type = "col"; bar.grouping = "clustered"
-    bar.title = title; bar.style = 10; bar.width = w; bar.height = h
-    bar.y_axis.title = "Distinct Number Count"; bar.y_axis.numFmt = "0"
-    bar.y_axis.majorGridlines = None
-    for vc in range(v_start, v_end + 1):
-        bar.add_data(Reference(ws_d, min_col=vc, min_row=d_start, max_row=d_end),
-                     titles_from_data=True)
-    cats = Reference(ws_d, min_col=cat_c, min_row=d_start + 1, max_row=d_end)
-    bar.set_categories(cats)
-    for s in bar.series:
-        s.dLbls = openpyxl.chart.label.DataLabelList()
-        s.dLbls.showVal = True; s.dLbls.showLegendKey = False
-        s.dLbls.showCatName = False; s.dLbls.showSerName = False
-    line = LineChart()
-    line.add_data(Reference(ws_d, min_col=tot_c, min_row=d_start, max_row=d_end),
-                  titles_from_data=True)
-    line.set_categories(cats)
-    ls = line.series[0]
-    ls.marker.symbol = "circle"; ls.marker.size = 7
-    ls.graphicalProperties.line.solidFill = "FF0000"
-    ls.graphicalProperties.line.width = 25000
-    ls.dLbls = openpyxl.chart.label.DataLabelList(); ls.dLbls.showVal = True
-    bar += line
-    return bar
-
-
-# ── Clear sheet ───────────────────────────────────────────────────────────────
-
-def _clear_sheet(ws):
-    for mr in list(ws.merged_cells.ranges):
-        ws.unmerge_cells(str(mr))
-    for row in ws.iter_rows():
-        for cell in row:
-            if isinstance(cell, openpyxl.cell.cell.MergedCell):
-                continue
-            cell.value = None; cell.font = Font(); cell.fill = PatternFill()
-            cell.border = Border(); cell.alignment = Alignment()
-            cell.number_format = "General"
-    ws.row_dimensions.clear(); ws.column_dimensions.clear()
-    ws.freeze_panes = None
-
-
-# ── Generic pivot table writer ────────────────────────────────────────────────
-
-def _write_pivot_table(ws, current_row, title, row_label_header,
-                       row_labels, col_labels, col_keys, value_matrix,
-                       row_label_map=None, section_title=None):
-    """
-    Write one pivot block into ws starting at current_row.
-    value_matrix : dict { row_label -> { col_key -> int } }
-                   values are DISTINCT counts of the Number column.
-    Returns: (header_row, total_row, next_free_row)
-    """
-    n_cols = len(col_keys)
-    total_col = n_cols + 2
-
-    # avg across all body cells for traffic-light
-    all_vals = [value_matrix.get(rl, {}).get(ck, 0)
-                for rl in row_labels for ck in col_keys]
-    avg_val = (sum(all_vals) / len(all_vals)) if all_vals else 0
-
-    # Optional section heading
-    if section_title:
-        ws.merge_cells(start_row=current_row, start_column=1,
-                       end_row=current_row, end_column=total_col)
-        c = ws.cell(row=current_row, column=1, value=section_title)
-        c.fill = HEADER_FILL
-        c.font = Font(bold=True, color=WHITE, name="Arial", size=12)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[current_row].height = 24
-        current_row += 1
-
-    # Header row
-    hcell(ws, current_row, 1, row_label_header)
-    for ci, cl in enumerate(col_labels, 2):
-        hcell(ws, current_row, ci, cl)
-    hcell(ws, current_row, total_col, "Total")
-    header_row = current_row
-    current_row += 1
-
-    # Data rows
-    data_start = current_row
-    for pi, rl in enumerate(row_labels):
-        fill_alt = ALT_PAT if pi % 2 == 0 else None
-        label = row_label_map.get(rl, rl) if row_label_map else rl
-        dcell(ws, current_row, 1, label, fill=fill_alt, align="left")
-        row_sum = 0
-        for ci, ck in enumerate(col_keys, 2):
-            val = value_matrix.get(rl, {}).get(ck, 0)
-            row_sum += val
-            _tl_dcell(ws, current_row, ci, val, avg_val)
-        fl = get_column_letter(2) + str(current_row)
-        ll = get_column_letter(n_cols + 1) + str(current_row)
-        tc = ws.cell(row=current_row, column=total_col, value=f"=SUM({fl}:{ll})")
-        tc.font = Font(name="Arial", size=10, bold=True, color="000000")
-        tc.alignment = Alignment(horizontal="center", vertical="center")
-        tc.border = _border()
-        tc.fill = _traffic_fill_avg(row_sum, avg_val)
-        current_row += 1
-
-    # Total row
-    hcell(ws, current_row, 1, "Total", fill=TOTAL_FILL)
-    for wi in range(2, n_cols + 2):
-        cl = get_column_letter(wi)
-        hcell(ws, current_row, wi,
-              f"=SUM({cl}{data_start}:{cl}{current_row-1})", fill=TOTAL_FILL)
-    tl = get_column_letter(total_col)
-    hcell(ws, current_row, total_col,
-          f"=SUM({tl}{data_start}:{tl}{current_row-1})", fill=TOTAL_FILL)
-    total_row = current_row
-    current_row += 1
-
-    return header_row, total_row, current_row
-
-
-# ── Closure data tab writer ───────────────────────────────────────────────────
-
-def _write_closure_data(ws, df_group, start_col_name, task_col_name, log):
-    if df_group.empty:
-        log(" ⚠️ No rows for this group after filtering.")
-        return None
-
-    df_g = (
-        df_group
-        .sort_values(by=start_col_name, ascending=False, na_position="last")
-        .drop_duplicates(subset=[task_col_name], keep="first")
-        .copy()
-    )
-    before = len(df_g)
-    assigned_col = find_col(df_g, ["assigned to", "assigned_to", "assignedto"])
-    if assigned_col:
-        df_g = df_g[df_g[assigned_col].notna() &
-                    (df_g[assigned_col].astype(str).str.strip() != "")]
-    removed_blank = before - len(df_g)
-    log(f" {len(df_g):,} rows "
-        f"(kept latest per task; dropped {removed_blank} blank Assigned To)")
-
-    headers = list(df_g.columns)
-    for ci, h in enumerate(headers, 1):
-        hcell(ws, 1, ci, h)
-
-    for ri, row in enumerate(df_g.itertuples(index=False), 2):
-        fill = ALT_PAT if ri % 2 == 0 else None
-        for ci, val in enumerate(row, 1):
-            c = ws.cell(row=ri, column=ci, value=val)
-            c.font = Font(name="Arial", size=10)
-            c.alignment = Alignment(vertical="center")
-            c.border = _border()
-            if fill: c.fill = fill
-            if headers[ci - 1] == start_col_name and val:
-                c.number_format = "DD/MM/YYYY"
-
-    autofit(ws); ws.freeze_panes = "A2"
-    return df_g
-
-
-# ── Closure summary table writer ──────────────────────────────────────────────
-
-def _write_closure_summary(ws, df_clean, group_keyword,
-                            task_col_name, start_col_name,
-                            selected_months, log):
-    if df_clean is None or df_clean.empty:
-        log(" ⚠️ No data for summary table.")
-        return
-
-    assigned_col = find_col(df_clean, ["assigned to", "assigned_to", "assignedto"])
-    if not assigned_col:
-        log(" ⚠️ 'Assigned To' column not found — skipping summary.")
-        return
-
-    df_clean = df_clean.copy()
-    df_clean["_month"] = df_clean[start_col_name].apply(
-        lambda d: d.date().replace(day=1) if pd.notna(d) else None
-    )
-    df_sm = df_clean[df_clean["_month"].isin(selected_months)].copy()
-
-    pivot = (
-        pd.pivot_table(df_sm, index=assigned_col, columns="_month",
-                       values=task_col_name, aggfunc="count", fill_value=0)
-        if not df_sm.empty else pd.DataFrame()
-    )
-
-    sel_months_sorted = sorted(selected_months)
-    month_labels = [fmt_month(m) for m in sel_months_sorted]
-    n_months = len(sel_months_sorted)
-    total_col = n_months + 2
-    people = sorted(df_sm[assigned_col].dropna().unique()) if not df_sm.empty else []
-
-    all_vals = []
-    person_vals = {}
-    for person in people:
-        row_vals = {}
-        for mo in sel_months_sorted:
-            v = (int(pivot.loc[person, mo])
-                 if not pivot.empty and person in pivot.index
-                 and mo in pivot.columns else 0)
-            row_vals[mo] = v
-            all_vals.append(v)
-        row_vals["_total"] = sum(row_vals[mo] for mo in sel_months_sorted)
-        person_vals[person] = row_vals
-
-    avg_val = (sum(all_vals) / len(all_vals)) if all_vals else 0
-
-    ws.merge_cells(f"A1:{get_column_letter(total_col)}1")
-    c = ws.cell(row=1, column=1,
-                value=f"Closure Summary — {group_keyword} — Assigned To by Month")
-    c.fill = HEADER_FILL
-    c.font = Font(bold=True, color=WHITE, name="Arial", size=12)
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 24
-
-    hcell(ws, 2, 1, "Assigned To")
-    for mi, ml in enumerate(month_labels, 2):
-        hcell(ws, 2, mi, ml)
-    hcell(ws, 2, total_col, "Total")
-
-    DR0 = 3
-    for pi, person in enumerate(people):
-        r = DR0 + pi
-        row_vals = person_vals[person]
-        total = row_vals["_total"]
-        dcell(ws, r, 1, person, fill=None, align="left")
-        for mi, mo in enumerate(sel_months_sorted, 2):
-            _tl_dcell(ws, r, mi, row_vals[mo], avg_val)
-        fl = get_column_letter(2) + str(r)
-        ll = get_column_letter(n_months + 1) + str(r)
-        tc = ws.cell(row=r, column=total_col, value=f"=SUM({fl}:{ll})")
-        tc.font = Font(name="Arial", size=10, bold=True, color="000000")
-        tc.alignment = Alignment(horizontal="center", vertical="center")
-        tc.border = _border()
-        tc.fill = _traffic_fill_avg(total, avg_val)
-
-    TR = DR0 + len(people)
-    hcell(ws, TR, 1, "Total", fill=TOTAL_FILL)
-    for mi in range(2, n_months + 2):
-        cl = get_column_letter(mi)
-        hcell(ws, TR, mi, f"=SUM({cl}{DR0}:{cl}{TR-1})", fill=TOTAL_FILL)
-    tl = get_column_letter(total_col)
-    hcell(ws, TR, total_col, f"=SUM({tl}{DR0}:{tl}{TR-1})", fill=TOTAL_FILL)
-
-    autofit(ws); ws.column_dimensions["A"].width = 32; ws.freeze_panes = "B3"
-
-    leg_row = TR + 2
-    _cell(ws, leg_row, 1, "Colour scale (avg-based, ±20% tolerance):",
-          bold=True, align="left", sz=9)
-    for col_i, (label, lfill) in enumerate([
-            ("Below avg → Red", RED_FILL),
-            ("~Average → Amber", AMBER_FILL),
-            ("Above avg → Green", GREEN_FILL),
-    ], 2):
-        c = ws.cell(row=leg_row, column=col_i, value=label)
-        c.fill = lfill; c.font = Font(name="Arial", size=9, bold=True, color="000000")
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = _border()
-
-    log(f" ✅ {len(people)} people × {n_months} months (avg={avg_val:.1f})")
-
-
-# ── Core workbook builder ─────────────────────────────────────────────────────
-
-def build_workbook(
-    raw_data_bytes: bytes,
-    master_bytes: bytes,
-    master_filename: str,
-    selected_weeks: list,
-    selected_months: list,
-    log=print
-) -> bytes:
-
-    log("📂 Reading raw data...")
-    df_raw = pd.read_excel(io.BytesIO(raw_data_bytes), sheet_name=0)
-    log(f" {len(df_raw):,} rows | {len(df_raw.columns)} columns")
-
-    task_col = find_col(df_raw, ["task number", "task_number", "task"])
-    group_col = find_col(df_raw, ["assignment group", "assignment_group", "group"])
-    start_col = find_col(df_raw, ["start", "start date", "start_date", "created"])
-    priority_col = find_col(df_raw, ["priority"])
-    number_col = find_col(df_raw, ["number", "no", "num"])
-
-    if number_col:
-        log(f" ✅ Number column found: '{number_col}' — all pivots will use DISTINCT COUNT of this column")
-    else:
-        raise ValueError(
-            "Number column not found (tried: 'number', 'no', 'num').\n"
-            f"Available columns: {list(df_raw.columns)}\n"
-            "Please ensure your raw data has a column named 'Number' (or 'No' / 'Num')."
-        )
-
-    missing = [n for n, c in [("Task Number", task_col),
-                               ("Assignment Group", group_col),
-                               ("Start", start_col)] if c is None]
-    if missing:
-        raise ValueError(f"Required columns not found: {missing}\n"
-                         f"Available: {list(df_raw.columns)}")
-
-    df_raw = df_raw.copy()
-    df_raw[start_col] = pd.to_datetime(df_raw[start_col], errors="coerce")
-
-    # Add week / month helper columns directly on raw data
-    df_raw["_Start_Week"] = df_raw[start_col].apply(
-        lambda d: (d - pd.Timedelta(days=d.weekday())).date() if pd.notna(d) else None
-    )
-    df_raw["_Start_Month"] = df_raw[start_col].apply(
-        lambda d: d.date().replace(day=1) if pd.notna(d) else None
-    )
-
-    if priority_col:
-        df_raw[priority_col] = df_raw[priority_col].astype(str).str.strip()
-
-    # ── Load master & clear managed tabs ─────────────────────────────────────
-    log("📂 Loading master workbook...")
-    wb = load_workbook(io.BytesIO(master_bytes))
-
-    log("🧹 Clearing managed tabs...")
-    for tab in MANAGED_TABS:
-        if tab not in wb.sheetnames:
-            wb.create_sheet(tab)
-            log(f" Created missing sheet: '{tab}'")
-        _clear_sheet(wb[tab])
-        log(f" Cleared: '{tab}'")
-
-    # ── Step 1: Original with Dups ────────────────────────────────────────────
-    log("📝 Writing 'Original with Dups'...")
-    ws_orig = wb["Original with Dups"]
-    # Write without the helper columns (they're internal)
-    df_display = df_raw.drop(columns=["_Start_Week", "_Start_Month"])
-    headers = list(df_display.columns)
-    for ci, h in enumerate(headers, 1):
-        hcell(ws_orig, 1, ci, h)
-    for ri, row in enumerate(df_display.itertuples(index=False), 2):
-        fill = ALT_PAT if ri % 2 == 0 else None
-        for ci, val in enumerate(row, 1):
-            c = ws_orig.cell(row=ri, column=ci, value=val)
-            c.font = Font(name="Arial", size=10)
-            c.alignment = Alignment(vertical="center"); c.border = _border()
-            if fill: c.fill = fill
-            if headers[ci - 1] == start_col and val:
-                c.number_format = "DD/MM/YYYY"
-    autofit(ws_orig); ws_orig.freeze_panes = "A2"
-    log(f" ✅ {len(df_raw):,} rows written")
-
-    # ── Filter raw data by selected weeks ─────────────────────────────────────
-    df_f = df_raw[df_raw["_Start_Week"].isin(selected_weeks)].copy()
-    week_labels = [fmt_week(w) for w in selected_weeks]
-    n_weeks = len(selected_weeks)
-    total_col_i = n_weeks + 2
-
-    groups = sorted(df_f[group_col].dropna().unique())
-    priorities = [p for p in PRIORITY_ORDER
-                  if priority_col and p in df_f[priority_col].values]
-    if not priorities and priority_col:
-        priorities = sorted(df_f[priority_col].dropna().unique())
-    log(f" {len(groups)} groups | {n_weeks} weeks selected "
-        f"| {len(df_f):,} rows in week range")
-
-    # ── Charts sheet ──────────────────────────────────────────────────────────
-    ws_charts = wb["Charts"]
-    _cell(ws_charts, 1, 1, "All Charts — Distinct Count of Number", bold=True, sz=14)
-    ws_charts.column_dimensions["A"].width = 2
-    chart_row = [3]
-
-    def _place(chart, row_span=32):
-        ws_charts.add_chart(chart, f"B{chart_row[0]}")
-        chart_row[0] += row_span + 1
-
-    # ── Step 2: WTBP (Priority × Week, distinct Number count per Group) ──────
-    log("📋 Building 'WTBP' (distinct Number count)...")
-    ws_wtbp = wb["WTBP"]
-    current_row = 1
-
-    for grp_idx, grp in enumerate(groups):
-        df_grp = df_f[df_f[group_col] == grp]
-
-        # Distinct count pivot: rows=priority, cols=week, values=nunique(number)
-        pivot_dc = _distinct_count_pivot(df_grp, priority_col, "_Start_Week", number_col) \
-                   if priority_col and not df_grp.empty else pd.DataFrame()
-
-        vm = {}
-        for prio in priorities:
-            vm[prio] = {}
-            for wk in selected_weeks:
-                vm[prio][wk] = (int(pivot_dc.loc[prio, wk])
-                                if not pivot_dc.empty and prio in pivot_dc.index
-                                and wk in pivot_dc.columns else 0)
-
-        hr, tr, current_row = _write_pivot_table(
-            ws_wtbp, current_row, grp, "Priority",
-            priorities, week_labels, selected_weeks, vm,
-            row_label_map=PRIORITY_LABELS,
-            section_title=grp
-        )
-        _place(_combo(ws_wtbp, hr, tr, 1, 2, n_weeks + 1, total_col_i,
-                      f"{grp} – Priority by Week (Distinct #)"))
-        current_row += 1
-        if grp_idx < len(groups) - 1:
-            current_row += 3
-
-    autofit(ws_wtbp); ws_wtbp.column_dimensions["A"].width = 20
-    log(f" ✅ {len(groups)} groups written to 'WTBP'")
-
-    # ── Step 3: VolumeAnalysis (Group × Week, distinct Number count) ─────────
-    log("📊 Building 'VolumeAnalysis' (distinct Number count)...")
-    ws_va = wb["VolumeAnalysis"]
-
-    vol_dc = _distinct_count_pivot(df_f, group_col, "_Start_Week", number_col) \
-             if not df_f.empty else pd.DataFrame()
-
-    vm_va = {}
-    for grp in groups:
-        vm_va[grp] = {}
-        for wk in selected_weeks:
-            vm_va[grp][wk] = (int(vol_dc.loc[grp, wk])
-                              if not vol_dc.empty and grp in vol_dc.index
-                              and wk in vol_dc.columns else 0)
-
-    hr_va, tr_va, _ = _write_pivot_table(
-        ws_va, 1, "Weekly Volume", "Assignment Group",
-        groups, week_labels, selected_weeks, vm_va,
-        section_title="Weekly Volume by Assignment Group (Distinct Number Count)"
-    )
-    autofit(ws_va); ws_va.column_dimensions["A"].width = 32; ws_va.freeze_panes = "B3"
-    _place(_combo(ws_va, hr_va, tr_va, 1, 2, n_weeks + 1, n_weeks + 2,
-                  "Weekly Volume – Distinct Number Count", w=28, h=16), row_span=38)
-    log(" ✅ 'VolumeAnalysis' written")
-
-    # ── Step 4: MonthlyVolume (Group × Month, distinct Number count) ─────────
-    log("📅 Building 'MonthlyVolume' (distinct Number count)...")
-    ws_mv = wb["MonthlyVolume"]
-
-    df_monthly = df_raw[df_raw["_Start_Month"].isin(selected_months)].copy()
-    sel_months_sorted = sorted(selected_months)
-    month_labels = [fmt_month(m) for m in sel_months_sorted]
-    n_months = len(sel_months_sorted)
-    all_groups_mv = sorted(df_monthly[group_col].dropna().unique())
-
-    mv_dc = _distinct_count_pivot(df_monthly, group_col, "_Start_Month", number_col) \
-            if not df_monthly.empty else pd.DataFrame()
-
-    vm_mv = {}
-    for grp in all_groups_mv:
-        vm_mv[grp] = {}
-        for mo in sel_months_sorted:
-            vm_mv[grp][mo] = (int(mv_dc.loc[grp, mo])
-                              if not mv_dc.empty and grp in mv_dc.index
-                              and mo in mv_dc.columns else 0)
-
-    hr_mv, tr_mv, _ = _write_pivot_table(
-        ws_mv, 1, "Monthly Volume", "Assignment Group",
-        all_groups_mv, month_labels, sel_months_sorted, vm_mv,
-        section_title="Monthly Volume by Assignment Group (Distinct Number Count)"
-    )
-    autofit(ws_mv); ws_mv.column_dimensions["A"].width = 32; ws_mv.freeze_panes = "B3"
-    _place(_combo(ws_mv, hr_mv, tr_mv, 1, 2, n_months + 1, n_months + 2,
-                  "Monthly Volume – Distinct Number Count", w=28, h=16), row_span=38)
-    log(f" ✅ 'MonthlyVolume' written ({len(all_groups_mv)} groups × {n_months} months)")
-
-    # ── Step 5: Closure tabs ──────────────────────────────────────────────────
-    log("🔒 Building Closure tabs...")
-    for keyword, data_tab, summary_tab in CLOSURE_GROUPS:
-        log(f" ── {keyword} ──")
-        mask = (df_raw[group_col].astype(str)
-                      .str.strip().str.lower() == keyword.strip().lower())
-        df_grp_raw = df_raw[mask].drop(columns=["_Start_Week", "_Start_Month"]).copy()
-        log(f" {len(df_grp_raw):,} rows matched '{keyword}'")
-        ws_data = wb[data_tab]
-        df_clean = _write_closure_data(ws_data, df_grp_raw, start_col, task_col, log)
-        ws_sum = wb[summary_tab]
-        _write_closure_summary(ws_sum, df_clean, keyword, task_col, start_col,
-                               selected_months, log)
-    log(" ✅ All Closure tabs written")
-
-    # ── Reorder sheets ────────────────────────────────────────────────────────
-    for idx, name in enumerate(MANAGED_TABS):
-        if name in wb.sheetnames:
-            cur_idx = wb.sheetnames.index(name)
-            wb.move_sheet(name, offset=idx - cur_idx)
-
-    log("💾 Saving workbook...")
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-    log("✅ ALL DONE!")
-    return buf.read()
-
-
-# ── Download helper ───────────────────────────────────────────────────────────
-
-def _show_download(result_bytes: bytes, out_filename: str):
-    from IPython.display import display, FileLink
-    candidates = [os.path.expanduser("~"), tempfile.gettempdir(), os.getcwd()]
-    save_dir = None
-    for d in candidates:
-        try:
-            test = os.path.join(d, ".write_test")
-            with open(test, "w") as f: f.write("x")
-            os.remove(test); save_dir = d; break
-        except OSError:
-            continue
-    if save_dir is None:
-        print("❌ No writable directory found."); return
-    save_path = os.path.join(save_dir, out_filename)
-    with open(save_path, "wb") as f: f.write(result_bytes)
-    print(f"\n✅ File saved → {save_path}\nClick the link below to download:\n")
-    display(FileLink(save_path, result_html_prefix="⬇️ "))
-
-
-# ── Jupyter UI ────────────────────────────────────────────────────────────────
-
-def run_jupyter():
-    import ipywidgets as widgets
-    from IPython.display import display, clear_output
-
-    display(widgets.HTML("""
-        <div style="background:#1E3A5F;padding:14px 20px;border-radius:8px;
-                    margin-bottom:10px">
-            <h2 style="color:white;margin:0;font-family:Arial;font-size:18px">
-                📊 Excel Automation Tool v12
-            </h2>
-            <p style="color:#aad4f5;margin:6px 0 0;font-family:Arial;font-size:12px">
-                1 Upload master &nbsp;→&nbsp; 2 Upload raw data &nbsp;→&nbsp;
-                3 Pick weeks &nbsp;→&nbsp; 4 Pick months &nbsp;→&nbsp;
-                5 Run &nbsp;→&nbsp; 6 Download
-            </p>
-            <p style="color:#aad4f5;margin:4px 0 0;font-family:Arial;font-size:11px">
-                Pivot values = DISTINCT COUNT of Number column · Source = Original with Dups
-            </p>
-        </div>
-    """))
-
-    master_uploader = widgets.FileUpload(
-        accept=".xlsx", multiple=False, description="📁 Master File",
-        button_style="primary", layout=widgets.Layout(width="230px"))
-    master_status = widgets.HTML(
-        "<span style='color:grey;font-size:12px;font-family:Arial'>"
-        "The master workbook</span>")
-
-    raw_uploader = widgets.FileUpload(
-        accept=".xlsx", multiple=False, description="📁 Raw Data File",
-        button_style="warning", layout=widgets.Layout(width="230px"))
-    raw_status = widgets.HTML(
-        "<span style='color:grey;font-size:12px;font-family:Arial'>"
-        "New raw data to process</span>")
-
-    week_header = widgets.HTML("", layout=widgets.Layout(display="none"))
-    week_grid = widgets.GridBox([], layout=widgets.Layout(display="none"))
-    w_sel_all_btn = widgets.Button(description="☑ Select All", button_style="info",
-        layout=widgets.Layout(width="130px", display="none", margin="0 8px 8px 0"))
-    w_clr_all_btn = widgets.Button(description="☐ Clear All", button_style="warning",
-        layout=widgets.Layout(width="130px", display="none", margin="0 0 8px 0"))
-
-    month_header = widgets.HTML("", layout=widgets.Layout(display="none"))
-    month_grid = widgets.GridBox([], layout=widgets.Layout(display="none"))
-    m_sel_all_btn = widgets.Button(description="☑ Select All", button_style="info",
-        layout=widgets.Layout(width="130px", display="none", margin="0 8px 8px 0"))
-    m_clr_all_btn = widgets.Button(description="☐ Clear All", button_style="warning",
-        layout=widgets.Layout(width="130px", display="none", margin="0 0 8px 0"))
-
-    run_btn = widgets.Button(description="▶ Run & Update Master",
-        button_style="success",
-        layout=widgets.Layout(width="230px", margin="12px 0 0 0"), disabled=True)
-    out = widgets.Output(layout=widgets.Layout(
-        border="1px solid #ddd", padding="12px", border_radius="6px",
-        min_height="60px", margin_top="10px"))
-
-    display(
-        widgets.HTML("<b style='font-family:Arial;font-size:13px'>1 Master Workbook</b>"),
-        master_uploader, master_status,
-        widgets.HTML("<b style='font-family:Arial;font-size:13px'>2 Raw Data File</b>"),
-        raw_uploader, raw_status,
-        week_header, widgets.HBox([w_sel_all_btn, w_clr_all_btn]), week_grid,
-        month_header, widgets.HBox([m_sel_all_btn, m_clr_all_btn]), month_grid,
-        run_btn, out
-    )
-
-    _ctx = {"master_bytes": None, "master_filename": None, "raw_bytes": None}
-    _week_cbs = {}
-    _month_cbs = {}
-
-    def _try_enable():
-        run_btn.disabled = not (_ctx["master_bytes"] and _ctx["raw_bytes"]
-                                and _week_cbs and _month_cbs)
-
-    def _build_week_ui(weeks):
-        _week_cbs.clear()
-        boxes = []
-        for w in weeks:
-            cb = widgets.Checkbox(value=True, description=fmt_week(w),
-                layout=widgets.Layout(width="115px"),
-                style={"description_width": "0px"})
-            _week_cbs[w] = cb; boxes.append(cb)
-        week_header.value = (f"<b style='font-family:Arial;font-size:13px'>"
-                             f"3 Select weeks ({len(weeks)} found):</b>")
-        week_header.layout.display = ""
-        week_grid.children = boxes
-        week_grid.layout = widgets.Layout(
-            grid_template_columns="repeat(6, 120px)", display="", margin="4px 0 0 0")
-        w_sel_all_btn.layout.display = ""; w_clr_all_btn.layout.display = ""
-
-    def _build_month_ui(months):
-        _month_cbs.clear()
-        boxes = []
-        for m in months:
-            cb = widgets.Checkbox(value=True, description=fmt_month(m),
-                layout=widgets.Layout(width="120px"),
-                style={"description_width": "0px"})
-            _month_cbs[m] = cb; boxes.append(cb)
-        month_header.value = (f"<b style='font-family:Arial;font-size:13px'>"
-                              f"4 Select months ({len(months)} found):</b>")
-        month_header.layout.display = ""
-        month_grid.children = boxes
-        month_grid.layout = widgets.Layout(
-            grid_template_columns="repeat(4, 130px)", display="", margin="4px 0 0 0")
-        m_sel_all_btn.layout.display = ""; m_clr_all_btn.layout.display = ""
-
-    def on_master_upload(change):
-        fname, content = _read_upload(master_uploader)
-        if not fname: return
-        _ctx["master_bytes"] = content; _ctx["master_filename"] = fname
-        master_status.value = (
-            f"<span style='color:green;font-size:12px;font-family:Arial'>"
-            f"✅ <b>{fname}</b> loaded — {len(content)/1024:.1f} KB</span>")
-        _try_enable()
-
-    def on_raw_upload(change):
-        fname, content = _read_upload(raw_uploader)
-        if not fname: return
-        _ctx["raw_bytes"] = content
-        raw_status.value = (
-            f"<span style='color:grey;font-size:12px;font-family:Arial'>"
-            f"⏳ Scanning <b>{fname}</b>...</span>")
-        try:
-            weeks, months, _ = get_weeks_and_months_from_bytes(content)
-        except Exception as e:
-            raw_status.value = f"<span style='color:red;font-size:12px'>❌ Error: {e}</span>"
-            return
-        if not weeks:
-            raw_status.value = ("<span style='color:red;font-size:12px'>"
-                                "❌ No Start column found.</span>"); return
-        raw_status.value = (
-            f"<span style='color:green;font-size:12px;font-family:Arial'>"
-            f"✅ <b>{fname}</b> — {len(content)/1024:.1f} KB — "
-            f"{len(weeks)} week(s), {len(months)} month(s) detected</span>")
-        _build_week_ui(weeks); _build_month_ui(months); _try_enable()
-
-    def on_w_sel_all(_):
-        for cb in _week_cbs.values(): cb.value = True
-    def on_w_clr_all(_):
-        for cb in _week_cbs.values(): cb.value = False
-    def on_m_sel_all(_):
-        for cb in _month_cbs.values(): cb.value = True
-    def on_m_clr_all(_):
-        for cb in _month_cbs.values(): cb.value = False
-
-    def on_run(_):
-        with out:
-            clear_output()
-            if not _ctx["master_bytes"]: print("❌ Upload master."); return
-            if not _ctx["raw_bytes"]: print("❌ Upload raw data."); return
-            sel_weeks = sorted(w for w, cb in _week_cbs.items() if cb.value)
-            sel_months = sorted(m for m, cb in _month_cbs.items() if cb.value)
-            if not sel_weeks: print("❌ No weeks selected."); return
-            if not sel_months: print("❌ No months selected."); return
-            print(f"⚙️ Weeks : {fmt_week(sel_weeks[0])} → {fmt_week(sel_weeks[-1])} "
-                  f"({len(sel_weeks)} selected)\n"
-                  f"⚙️ Months: {fmt_month(sel_months[0])} → {fmt_month(sel_months[-1])} "
-                  f"({len(sel_months)} selected)\n")
-            try:
-                result_bytes = build_workbook(
-                    raw_data_bytes = _ctx["raw_bytes"],
-                    master_bytes = _ctx["master_bytes"],
-                    master_filename = _ctx["master_filename"],
-                    selected_weeks = sel_weeks,
-                    selected_months = sel_months,
-                    log = lambda m: print(m)
-                )
-                _show_download(result_bytes, _ctx["master_filename"])
-            except Exception:
-                print("❌ Error:"); traceback.print_exc()
-
-    master_uploader.observe(on_master_upload, names="value")
-    raw_uploader.observe(on_raw_upload, names="value")
-    w_sel_all_btn.on_click(on_w_sel_all); w_clr_all_btn.on_click(on_w_clr_all)
-    m_sel_all_btn.on_click(on_m_sel_all); m_clr_all_btn.on_click(on_m_clr_all)
-    run_btn.on_click(on_run)
-
-
-# ── CLI fallback ──────────────────────────────────────────────────────────────
-
-def run_cli(master_path: str, raw_path: str):
-    if not os.path.isfile(master_path): print(f"❌ {master_path}"); sys.exit(1)
-    if not os.path.isfile(raw_path): print(f"❌ {raw_path}"); sys.exit(1)
-
-    with open(raw_path, "rb") as f: raw_bytes = f.read()
-    with open(master_path, "rb") as f: master_bytes = f.read()
-
-    weeks, months, _ = get_weeks_and_months_from_bytes(raw_bytes)
-    if not weeks: print("❌ No Start values found."); sys.exit(1)
-
-    print(f"\n📅 {len(weeks)} weeks:")
-    for i, w in enumerate(weeks): print(f" [{i:2d}] {fmt_week(w)}")
-    raw = input("\nWeeks start/end index (Enter = all): ").strip()
-    try:
-        p = raw.split(); sel_weeks = weeks[int(p[0]):int(p[1]) + 1]
-    except Exception:
-        sel_weeks = weeks
-
-    print(f"\n📆 {len(months)} months:")
-    for i, m in enumerate(months): print(f" [{i:2d}] {fmt_month(m)}")
-    raw = input("\nMonths start/end index (Enter = all): ").strip()
-    try:
-        p = raw.split(); sel_months = months[int(p[0]):int(p[1]) + 1]
-    except Exception:
-        sel_months = months
-
-    result_bytes = build_workbook(
-        raw_data_bytes=raw_bytes, master_bytes=master_bytes,
-        master_filename=os.path.basename(master_path),
-        selected_weeks=sel_weeks, selected_months=sel_months)
-    with open(master_path, "wb") as f: f.write(result_bytes)
-    print(f"\n💾 Updated: {master_path}")
-
-
-# ── Entry ─────────────────────────────────────────────────────────────────────
-
-def main():
-    try:
-        from IPython import get_ipython
-        in_jupyter = get_ipython() is not None
-    except ImportError:
-        in_jupyter = False
-    if in_jupyter:
-        run_jupyter()
-    else:
-        if len(sys.argv) < 3:
-            print("Usage: python automate_excel_v12.py <master.xlsx> <raw.xlsx>")
-            sys.exit(1)
-        run_cli(sys.argv[1], sys.argv[2])
-
-main()
+1. Mandatory Field Label Formatting
+All mandatory/required field labels must be displayed in RED text throughout the entire GUI.
+
+This is a universal rule — any field marked as mandatory must have its label rendered in RED to provide a clear visual indicator to operators.
+
+The following fields must have RED labels:
+Chain Status
+Error Steps
+Infopackage Technical Name
+Failure Reason
+Recovery Process
+Fix Applied
+Owner
+Alert Email Received
+ABA for TBA (from transcript — confirm with manager if needed)
+
+When new mandatory fields are added in the future, they must also automatically receive RED labels.
+
+RED should be a clearly visible shade (e.g., #CC0000 or #E11D48) that contrasts against the form background.
+
+2. Read-Only / Greyed Out Fields
+The following fields must be converted to read-only with a greyed-out background. Users must not be able to click into, type in, or modify these fields in any way. The values must be populated automatically by the system.
+
+2.1 Completion Date and Time
+Current state: Editable field
+
+Required change: Make completely read-only and greyed out
+
+Auto-update rule: Value must be populated only upon job completion — when the process chain finishes successfully
+
+Failed job rule: If the job status is "Failed", this field must remain empty/blank — a failed job cannot have a completion timestamp. Do not show any value, placeholder, or default date
+
+Visual: Grey background (#E0E0E0 or similar), no cursor, non-clickable
+
+2.2 Failure Date and Time
+(from transcript)
+
+Current state: May be editable
+
+Required change: Make read-only and greyed out
+
+Auto-populate rule: Value must be auto-populated from the SAP BW system when a failure is detected — not entered manually
+
+Visual: Same grey background as other read-only fields
+
+2.3 Shift
+Current state: Editable field
+
+Required change: Make read-only, greyed out, and auto-calculated
+
+Calculation rule: Shift must be automatically determined based on the failure time:
+Define shift boundaries (e.g., Morning: 06:00–14:00, Afternoon: 14:00–22:00, Night: 22:00–06:00 — adjust to your organization's shift schedule)
+When a failure occurs, the system reads the failure timestamp and auto-assigns the correct shift
+
+Visual: Grey background, non-editable
+
+2.4 Process Chain Runtime (Renamed from "Run time")
+Current state: Field labeled "Run time", may be editable
+
+Required changes:
+Rename the field label from "Run time" to "Process Chain Runtime"
+Make the field read-only and greyed out
+Auto-calculate using the formula: Runtime = End Time − Start Time
+Show only for completed PCs — if the process chain has not completed, this field must remain empty/blank
+Do NOT calculate runtime for failed or still-running process chains
+
+2.5 PC Running for Last
+(New Field)
+
+Current state: Field does not exist — must be created
+
+Purpose: Show how long a process chain has been running when it has not yet completed (still in progress)
+
+Required behavior:
+Add a new field labeled "PC Running for Last"
+Field must be read-only, greyed out, and auto-calculated
+Calculation: Current Time − Start Time — showing elapsed running duration
+Applicable only for PCs that are not yet completed (still running)
+Once the PC completes, this field should clear/hide and the "Process Chain Runtime" field should populate instead
+The value should update automatically at regular intervals (e.g., every minute or on refresh)
+
+Placement: Near the runtime fields, adjacent to Process Chain Runtime
+
+2.6 Query Run Time
+(New Field)
+
+Current state: Field does not exist — must be created
+
+Purpose: Display the query execution time (added by Dhanashree to the query)
+
+Required behavior:
+Add a new field labeled "Query Run Time"
+Include this value in the query output / report
+Field should be read-only and greyed out
+
+Placement: In the query/report output area
+
+2.7 Global Read-Only Rule
+Any field that is automatically updated must NEVER be manually editable by the user
+
+All auto-calculated fields must have:
+Grey background color
+No text cursor on hover
+No click/focus response
+No keyboard input accepted
+
+This applies to: Completion Date/Time, Failure Date/Time, Shift, Process Chain Runtime, PC Running for Last, Query Run Time
+
+3. Field Renames
+The following field labels and button labels must be renamed throughout the GUI. Update all occurrences — labels, tooltips, headers, error messages, and any references in reports.
+
+#	Current Label	New Label	Type
+3.1	Run time	
+Process Chain Runtime
+
+Field label
+3.2	#of restart	
+#of repeat
+
+Field label
+3.3	OK	
+Save
+
+Button label
+3.4	Generate Report Preview	
+Preview Hourly Report
+
+Button label
+3.5	Copy as Table (Paste into Teams)	
+Copy Hourly Report to Clipboard
+
+Button label
+3.6	Hourly Report / Monitoring Log
+(section header)
+
+Monitoring Log Updates
+
+Section header
+Ensure all renames are consistent across the entire application — no instances of the old names should remain anywhere.
+
+4. New Fields to Add
+The following fields must be newly created and added to the GUI. They do not currently exist in the application.
+
+4.1 Owner Related Comments
+Type: Text area (multi-line free text)
+
+Mandatory: No
+
+Editable: Yes
+
+Placement: Positioned next to or directly below the Owner field in the main window
+
+Purpose: Allows operators to add context or comments related to the assigned owner
+
+4.2 Meta Chain Identifier
+Type: Text / ID field
+
+Mandatory: No
+
+Editable: Yes
+
+Placement: Near chain identification fields (e.g., near Process Chain name, Technical Name)
+
+Purpose: Provides a unique identifier for each Meta Chain
+
+4.3 Previous Status
+Type: Dropdown
+
+Mandatory: No (but recommended to fill)
+
+Editable: Yes
+
+Dropdown values: Failed, Fixed, Regarding, Completed
+
+Placement: Near status tracking fields, paired with Current Status
+
+Purpose: Records what the process chain's status was before the latest update
+
+4.4 Current Status
+Type: Dropdown
+
+Mandatory: No (but recommended to fill)
+
+Editable: Yes
+
+Dropdown values: Failed, Fixed, Regarding, Completed
+
+Placement: Directly next to or below Previous Status
+
+Purpose: Records what the process chain's status is now
+
+Combined behavior: Previous Status + Current Status together track state transitions:
+Example: Previous = "Failed" → Current = "Fixed" means the chain was fixed after a failure
+This pair provides a clear audit trail of status changes
+
+Storage: To be discussed with Prashant regarding where and how these values are stored and retrieved
+
+4.5 Average Runtime
+(from transcript)
+
+Type: Duration field
+
+Mandatory: No
+
+Editable: No (read-only, greyed out)
+
+Placement: Near runtime fields (Process Chain Runtime, PC Running for Last)
+
+Purpose: Stores the expected/average runtime for each process chain — used as a reference value for comparison
+
+Escalation behavior: If actual runtime (or PC Running for Last) exceeds this threshold, the system should trigger a visual alarm — see Section 9.5
+
+5. Fields to Remove from GUI
+5.1 Duplicate BW Recovery Notes
+Issue: There are multiple instances of the "BW Recovery Notes" field in the GUI
+
+Action: Keep only ONE BW Recovery Notes field. Remove all duplicate/extra instances
+
+Which to keep: Retain the primary instance in the main form section
+
+5.2 Duplicate ABAP / ABAP Step
+Issue: Both "ABAP" and "ABAP Step" fields exist — they capture the same information
+
+Action: Retain only one of the two fields. Remove the other completely
+
+Recommendation: Keep "ABAP Step" as it is more descriptive. Remove the generic "ABAP" field. (Confirm with team which to keep)
+
+5.3 Separate "Green" Section
+(from transcript)
+
+Issue: A separate section (visually styled in green) exists that duplicates fields from the main section
+
+Action: Remove the green section entirely. All data entry should happen in the primary section (visually styled in blue)
+
+Post-removal: Ensure no data is lost — any unique fields from the green section should be incorporated into the primary section before removal
+
+6. Dropdown Field Changes
+6.1 Failure Reason
+Current state: Unknown input method
+
+Required change: Implement dropdown selection WITH free-text typing option
+The field must support BOTH:
+Selecting a predefined reason from a dropdown list
+Typing a custom reason as free text
+This is a combo box / editable dropdown behavior — the user can either pick from the list or type their own value
+The dropdown list should contain all common/standard failure reasons
+Manager's decision: Both dropdown and free-text are allowed (not restricted to dropdown-only)
+
+6.2 SME Field
+(from transcript)
+
+Current state: May allow free-text typing
+
+Required change: Convert to selection-only dropdown — no free-text input allowed
+Users must pick from a predefined list of SMEs
+Keyboard input should be blocked — selection from list only
+The dropdown must contain at least 2 valid SME names for testing
+Purpose: Prevent junk/inconsistent data entry
+
+6.3 Area Field
+(from transcript)
+
+Current state: May be combined with SME or may not exist
+
+Required change: Create a separate standalone dropdown for Area
+Area and SME must be two distinct, independent fields — not combined
+Area dropdown should contain all valid processing areas
+
+6.4 Area → SME Auto-Population
+(from transcript)
+
+Required behavior: When an operator selects an Area from the Area dropdown, the SME dropdown must automatically populate with the SME(s) mapped to that area
+Example: Selecting "RB" (Retail Business) → SME dropdown auto-shows "Ludovic"
+Example: Selecting "Finance" → SME dropdown shows "Sarah, Mike" (multiple options)
+The mapping must be driven by a master mapping sheet that links Processing Area ↔ SME(s)
+Support one area mapping to multiple SMEs — in this case, show all valid SMEs in the dropdown and let the operator choose
+
+6.5 Fix Applied — Validation Constraint
+(from transcript)
+
+Current state: No constraint on selections
+
+Required change: Add validation logic to block simultaneous selection of "first and last"
+When "first" is selected, "last" should be disabled/greyed out (and vice versa)
+These two options are mutually exclusive — they cannot both be active at the same time
+
+6.6 Previous Status — New Dropdown
+Type: New dropdown field
+
+Values: Failed, Fixed, Regarding, Completed
+
+See Section 4.3 for full specification
+
+6.7 Current Status — New Dropdown
+Type: New dropdown field
+
+Values: Failed, Fixed, Regarding, Completed
+
+See Section 4.4 for full specification
+
+6.8 Alert Email Received
+(from transcript)
+
+Current state: Unknown input type
+
+Required change: Implement as an explicit Yes/No toggle or dropdown
+Only two valid values: "Yes" or "No"
+This field is mandatory — the operator must select one
+
+7. Window / Section / Layout Changes
+7.1 Merge Reports into One Section
+Current state: The GUI has two separate sections:
+"Hourly Report" section
+"Monitoring Log" section
+
+Required change: Merge both sections into ONE unified section
+
+New section name: "Monitoring Log Updates"
+
+Rules:
+Remove all duplicate fields that existed across both sections
+Consolidate all unique fields into the single merged section
+Operators should only need to fill in data once in one place
+The merged section should contain all fields from both former sections without redundancy
+
+7.2 Remove Separate "Green" Section
+(from transcript)
+
+Current state: A visually distinct section (green-styled) exists separately
+
+Required change: Remove the green section entirely
+
+Users fill only the primary (blue-styled) section
+
+Any unique fields from the green section must be moved to the primary section before removal
+
+7.3 Auto-Populate Merged Fields
+(from transcript)
+
+When sections are merged, any field that would duplicate information already captured in another part of the form must:
+Auto-populate with the value from the primary entry point
+Be greyed out and read-only to prevent the operator from entering the same data twice
+
+This ensures the no-duplication principle — capture once, display everywhere needed
+
+7.4 Owner Field Repositioning
+Current state: Owner field may be in a sub-section or non-primary location
+
+Required change: Move the Owner field to the main window
+
+Exact position (per manager): Below "Other Team" and beside "BW Recovery Notes"
+
+Include the new "Owner Related Comments" field adjacent to the Owner field
+
+Both fields should be clearly visible and accessible in the main form without scrolling or expanding sections
+
+7.5 Add Close/Exit Button on Popups
+(from transcript)
+
+Current state: Popup windows may lack a clear way to close them
+
+Required change: Add a clearly visible "X" button (or "Close" button) on ALL popup windows throughout the application
+
+Placement: Top-right corner of each popup (standard UI convention)
+
+Behavior: Clicking "X" or "Close" dismisses the popup without saving. If the user has unsaved changes, optionally show a confirmation dialog
+
+8. Button Changes
+8.1 Save Button (was "OK")
+Current label: "OK"
+
+New label: "Save"
+
+Behavior on click:
+Validate all mandatory fields — if any are empty, show RED borders around empty fields + error message. Do NOT save.
+If all mandatory fields are filled, update the Monitoring Log automatically with all entered values
+The saved record must appear in the Monitoring Log with all fields pre-populated — no manual re-entry into the log
+Show a brief success confirmation (e.g., "Record saved successfully" toast/message)
+
+8.2 Preview Hourly Report (was "Generate Report Preview")
+Current label: "Generate Report Preview"
+
+New label: "Preview Hourly Report"
+
+State logic (from transcript):
+DISABLED (greyed out, non-clickable) when any mandatory field is still empty
+ENABLED (active, clickable) only when ALL mandatory fields have been completed
+When disabled, show a tooltip on hover: "Complete all required fields to preview"
+When enabled, clicking generates a preview of the hourly report
+
+8.3 Copy Hourly Report to Clipboard (was "Copy as Table")
+Current label: "Copy as Table (Paste into Teams)"
+
+New label: "Copy Hourly Report to Clipboard"
+
+Behavior: Copies the current hourly report content to the system clipboard in a table format suitable for pasting into Microsoft Teams or email
+
+8.4 Archive Today
+(from transcript)
+
+Current state: May be always enabled
+
+Required change: The "Archive today" button must be enabled ONLY on the 24th hourly run/upload of the day
+
+All other times (runs 1 through 23): The button must be disabled (greyed out, non-clickable)
+
+Logic: Track the current run number for the day. Enable the archive button only when run_number == 24
+
+8.5 Close/X on Popups
+(from transcript)
+
+Add a close/exit button ("X" or "Close") to every popup window in the application
+
+See Section 7.5 for full specification
+
+9. Visual / Color Indicators
+9.1 Mandatory Field Labels — RED
+All mandatory field labels must be rendered in RED text
+
+See Section 1 for the complete list of mandatory fields
+
+RED color should be consistent across the entire application
+
+9.2 Failed/Unresolved Records — YELLOW Highlight
+(from transcript)
+
+Current state: Failed records appear in normal/default styling
+
+Required change: Any record (row) representing a failed process chain that has NOT been updated/resolved must be highlighted in YELLOW
+
+Highlight behavior:
+YELLOW background applied to the entire row
+The highlight remains until the operator updates the record with resolution details
+Once the record is properly updated (all required fields filled, status changed to Fixed/Completed), the YELLOW highlight is removed and the row returns to normal styling
+
+Purpose: Operators can instantly see which failures still need attention
+
+9.3 Completed PC Indicator
+Current state: No visual distinction for completed process chains
+
+Required change: Create a visual flag/indicator for process chains already marked as completed
+
+Options (choose one):
+✅ Green checkmark icon next to the chain name
+🟢 Green badge/dot in the status column
+Green background tint on the row
+"COMPLETED" text badge in a distinct color
+
+Purpose: Operators can quickly identify which PCs have finished successfully
+
+9.4 Read-Only Fields — Grey Background
+(from transcript)
+
+All read-only/auto-calculated fields must have a visually distinct grey background
+
+This creates a clear visual separation between:
+Editable fields: White/light background, active cursor on click
+Read-only fields: Grey background, no cursor, non-clickable
+
+Apply consistently to: Completion Date/Time, Failure Date/Time, Shift, Process Chain Runtime, PC Running for Last, Query Run Time, Average Runtime
+
+9.5 Runtime Alarm — Visual Alert
+(from transcript)
+
+Trigger: When a process chain's actual runtime (or "PC Running for Last" value) exceeds the Average Runtime threshold
+
+Visual response: Display a visual alarm on the affected record:
+Red highlight on the runtime cell/field
+Warning icon (⚠️) next to the runtime value
+Optional: Flashing indicator for critical overruns (e.g., 2x average runtime)
+
+Purpose: Proactively catch process chains running far beyond expected duration
+
+Example: A PO chain that normally takes ~2 hours has been running for 20+ hours — the alarm must trigger automatically so operators notice immediately, especially on weekends
+
+10. Input Validation Rules
+10.1 Count of Records — Numeric Only
+Field: Count of Records
+
+Validation: Accept numeric values only
+
+Behavior:
+Reject non-numeric keystrokes in real-time (letters, special characters)
+Allow only digits (0-9)
+If the user somehow enters non-numeric content, show an error: "This field accepts numbers only"
+
+10.2 #of repeat — Numeric Only
+(from transcript)
+
+Field: #of repeat (renamed from #of restart)
+
+Validation: Accept numeric values only
+
+Behavior: Same as Count of Records (10.1)
+
+10.3 Mandatory Field Validation on Save
+(from transcript)
+
+Trigger: When the operator clicks "Save"
+
+Validation:
+Check all mandatory fields (Chain Status, Error Steps, Infopackage Technical Name, Failure Reason, Recovery Process, Fix Applied, Owner, Alert Email Received)
+If any mandatory field is empty:
+Apply a RED border around the empty field(s)
+Display an error message: "Please fill in all required fields before saving"
+Do NOT save the record — keep the form open
+If all mandatory fields are filled:
+Proceed with save
+Update the Monitoring Log
+Show success confirmation
+
+10.4 Fix Applied — Mutual Exclusion
+(from transcript)
+
+Field: Fix Applied dropdown
+
+Validation: The options "first" and "last" are mutually exclusive — they cannot both be selected
+
+Behavior:
+When "first" is selected → "last" becomes disabled/greyed in the dropdown
+When "last" is selected → "first" becomes disabled/greyed in the dropdown
+When neither is selected → both remain available
+
+10.5 SME Dropdown — No Free Text
+(from transcript)
+
+Field: SME
+
+Validation: Input is blocked — the user can only select from the predefined list
+
+Behavior:
+Keyboard typing in the SME field is disabled
+Only mouse click / selection from dropdown list is allowed
+The dropdown auto-populates based on the selected Area (see Section 6.4)
+
+10.6 Preview Button — Conditional Enable
+(from transcript)
+
+Button: "Preview Hourly Report"
+
+Validation: The button is disabled by default and only becomes enabled when all mandatory fields have values
+
+Behavior when disabled:
+Button appears greyed out / non-clickable
+On hover, show a tooltip: "Complete all required fields to preview"
+
+Behavior when enabled:
+Button appears in active/primary color (e.g., blue)
+Clicking generates the report preview
+
+11. Reporting Changes
+11.1 Report Preview Button
+Rename "Generate Report Preview" to "Preview Hourly Report"
+
+See Section 8.2 for full behavior specification
+
+11.2 Copy Function Button
+Rename "Copy as Table (Paste into Teams)" to "Copy Hourly Report to Clipboard"
+
+See Section 8.3 for full behavior specification
+
+11.3 Previous Report Run History
+Requirement: Maintain and display entries from the previous report run
+
+Operators should be able to see what was reported in the last hourly cycle
+
+Implementation details: To be discussed with Prashant
+
+This enables:
+Continuity between shifts
+Verification that nothing was missed
+Correct time range derivation for daily/night reports
+
+11.4 Report Consistency
+(from transcript)
+
+Hourly and daily reports must contain identical content — same updates, same wording, no discrepancies
+
+Both reports must be generated from the same standardized source (PB1)
+
+There must be no conflicting wording across report types — if a failure is described one way in the hourly report, the daily report must use the exact same description
+
+12. Business Logic — Status Tracking
+12.1 Previous + Current Status Storage
+The system must store and manage paired status values for each process chain:
+Previous Status: What the status was before the latest update
+Current Status: What the status is now
+
+Valid status values: Failed, Fixed, Regarding, Completed
+
+Transition tracking examples:
+Previous: Failed → Current: Fixed (failure was resolved)
+Previous: Failed → Current: Regarding (under investigation)
+Previous: Regarding → Current: Completed (investigation led to completion)
+
+Storage mechanism: To be discussed with Prashant — determine where these values are persisted and how they are retrieved
+
+12.2 No-Assumptions Principle
+(from transcript)
+
+The system must log only what is actually known and confirmed
+
+Do NOT infer, assume, or auto-fill status or data that has not been explicitly entered/confirmed by the operator
+
+If information is unknown or pending, leave the field empty rather than guessing
+
+All logged entries must have the correct associated time context — the timestamp of when the update actually occurred
+
+13. Pending Discussion Items
+#	Item	Owner	What Needs to Be Decided
+1	
+Previous Report Run History
+
+Prashant	How to store, retrieve, and display entries from the previous report run
+2	
+Status Tracking Storage
+
+Prashant	Where and how Previous Status / Current Status values are persisted
+3	
+Query Run Time Specifications
+
+Dhanashree	Exact source, format, and placement of the new Query Run Time field
+4	
+Which ABAP field to keep
+
+Team	Keep "ABAP" or "ABAP Step"? Remove the other
+5	
+Shift time boundaries
+
+Team	Define exact shift start/end times for auto-calculation
+6	
+Average Runtime values
+
+Team	Where do baseline average runtimes come from? Manual entry or historical calculation?
+7	
+Runtime alarm threshold
+
+Team	What percentage over average triggers the alarm? (e.g., 150%? 200%?)
+14. Complete Change Summary
+Change Type	Count	Details
+Fields to make
+read-only / greyed out
+
+7	Completion Date/Time, Failure Date/Time, Shift, Process Chain Runtime, PC Running for Last, Query Run Time, Average Runtime
+Fields to
+rename
+
+6	Run time, #of restart, OK button, Generate Report Preview, Copy as Table, Section header
+Fields to
+add
+
+(new)	8	PC Running for Last, Query Run Time, Owner Related Comments, Meta Chain Identifier, Previous Status, Current Status, Average Runtime, Owner Related Comments
+Fields to
+remove
+
+3	Duplicate BW Recovery Notes, ABAP/ABAP Step duplicate, Green section
+Dropdown
+
+changes	8	Failure Reason combo, SME selection-only, Area standalone, Area→SME auto-populate, Fix Applied constraint, Previous Status, Current Status, Alert Email Yes/No
+Window/section
+
+changes	5	Merge reports, remove green section, auto-populate merged fields, add popup close buttons, reposition Owner
+Button
+
+changes	5	Save rename, Preview rename + conditional enable, Copy rename, Archive today 24th-run logic, Popup close buttons
+Visual indicators
+
+5	RED mandatory labels, YELLOW failed highlights, Completed PC flag, Grey read-only backgrounds, Runtime alarm
+Input validation
+
+rules	6	Numeric-only counts, mandatory validation on Save, Fix Applied mutual exclusion, SME no-free-text, Preview conditional enable, Tooltip on disabled preview
+TOTAL GUI CHANGES
+
+53
+
+15. Implementation Priority
+Priority	Changes	Reason
+🔴
+P1 — Critical
+
+Merge sections into Monitoring Log Updates, remove duplicate fields, rename all buttons, mandatory RED labels, Save button behavior with validation	Core structural changes — everything else depends on these being done first
+🔴
+P1 — Critical
+
+Add Previous/Current Status dropdowns, status tracking logic	Essential for monitoring log state tracking — core business requirement
+🔴
+P1 — Critical
+
+Read-only fields (Completion Date/Time, Shift, Process Chain Runtime) with auto-calculation	Data integrity — prevents manual errors in calculated fields
+🟠
+P2 — High
+
+New fields (PC Running for Last, Query Run Time, Meta Chain ID, Owner Related Comments)	Feature additions that provide new monitoring capabilities
+🟠
+P2 — High
+
+SME dropdown (selection-only), Area→SME auto-populate, Failure Reason combo box	Data quality enforcement — prevents junk data
+🟠
+P2 — High
+
+YELLOW highlight for failed records, Completed PC indicator, runtime alarm	Visual enhancements that improve operator situational awareness
+🟠
+P2 — High
+
+Input validation (numeric-only, mandatory field validation on Save, RED borders)	Data quality and error prevention at point of entry
+🟡
+P3 — Medium
+
+Owner field repositioning + Owner Related Comments	Layout improvement — functional but not blocking
+🟡
+P3 — Medium
+
+Previous Report Run History, report consistency rules	Reporting improvements — discuss with Prashant first
+🟢
+P4 — Low
+
+Archive today button logic (24th run only), close/exit buttons on popups	Edge case logic and UX polish — implement last
+16. Design Principles (Must Follow Throughout)
+#	Principle	Description
+P1
+
+Single source of truth
+
+PB1 drives all reporting. Master mapping sheet drives all SME data. No secondary/shadow data sources
+P2
+
+No duplicate data entry
+
+Capture information once, reuse everywhere. Merge sections, remove duplicate fields, auto-populate where possible
+P3
+
+No assumptions
+
+Log only verified/known data. Never infer status, timestamps, or field values. Leave unknown fields empty
+P4
+
+Auto-calculate where possible
+
+Shift, Completion Date/Time, Failure Date/Time, Process Chain Runtime, PC Running for Last — all auto-derived, never manual
+P5
+
+Enforce data quality
+
+Dropdowns preferred over free-text (except Failure Reason per manager), mandatory fields marked in RED, numeric constraints on count fields, selection-only SME field
+P6
+
+Consistent outputs
+
+Hourly report = daily report in content and wording. No conflicting descriptions across report types
+P7
+
+Clear state tracking
+
+Previous Status + Current Status with correct time context. Four defined states: Failed, Fixed, Regarding, Completed
+P8
+
+Proactive escalation
+
+Runtime thresholds trigger visual alarms automatically. No reliance on manual detection of overruns
+P9
+
+Manager's direction takes priority
+
+Where transcript discussion conflicts with manager's requirements, follow the manager's specification
